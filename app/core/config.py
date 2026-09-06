@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     environment: str = "development"
     debug: bool = False
 
+    github_webhook_secret: str = ""
+    database_url: str = "sqlite+aiosqlite:///./sandheal.db"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
