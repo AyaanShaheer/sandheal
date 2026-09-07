@@ -2,9 +2,9 @@ from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.application.repair_runs import RepairRunService
 from app.core.config import get_settings
 from app.infrastructure.database import get_session
-from app.infrastructure.repositories.repair_run import RepairRunRepository
 from app.integrations.github.security import verify_signature
 from app.integrations.github.webhook import (
     normalize_workflow_run,
@@ -80,9 +80,9 @@ async def github_webhook(
             },
         )
 
-    repository = RepairRunRepository(session)
+    service = RepairRunService(session)
 
-    run, created = await repository.create_from_github_failure(
+    run, created = await service.create_from_github_failure(
         failure_event,
     )
 

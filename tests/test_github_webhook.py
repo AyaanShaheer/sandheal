@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -15,6 +16,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.config import get_settings
 from app.infrastructure.database import Base, get_session
+from app.infrastructure.models.repair_job import RepairJobRecord
+from app.infrastructure.models.repair_run import RepairRunRecord
 from app.main import create_app
 
 WEBHOOK_SECRET = "test-secret"
@@ -78,13 +81,9 @@ def webhook_headers(
 
 
 @pytest.fixture
-def session_factory() -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
+def session_factory() -> async_sessionmaker[AsyncSession]:
     """
     Create an isolated SQLite database for each test.
-
-    The fixture itself is synchronous so pytest can manage it without
-    requiring an async-fixture plugin. Database setup/cleanup is
-    performed explicitly with asyncio.run().
     """
 
     async def setup_database():
@@ -118,7 +117,7 @@ def build_client(
     factory: async_sessionmaker[AsyncSession],
 ) -> TestClient:
     """
-    Build a FastAPI test client backed by the isolated test database.
+    Build a FastAPI test client using the isolated test database.
     """
 
     app = create_app()
@@ -138,14 +137,12 @@ def build_client(
     return TestClient(app)
 
 
-def test_failed_workflow_creates_repair_run(
+def test_failed_workflow_creates_repair_run_and_job(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     client = build_client(session_factory)
 
-    payload = build_payload(
-        conclusion="failure",
-    )
+    payload = build_payload()
 
     response = client.post(
         "/webhooks/github",
@@ -165,15 +162,36 @@ def test_failed_workflow_creates_repair_run(
     assert body["workflow_run_id"] == 123456
     assert body["run_id"]
 
+    async def verify_database() -> None:
+        async with session_factory() as session:
+            run = await session.scalar(
+                select(RepairRunRecord).where(
+                    RepairRunRecord.delivery_id == "delivery-123",
+                )
+            )
 
-def test_duplicate_delivery_returns_existing_run(
+            assert run is not None
+            assert run.status == "received"
+
+            job = await session.scalar(
+                select(RepairJobRecord).where(
+                    RepairJobRecord.run_id == run.id,
+                )
+            )
+
+            assert job is not None
+            assert job.status == "pending"
+            assert job.attempts == 0
+
+    asyncio.run(verify_database())
+
+
+def test_duplicate_delivery_returns_existing_run_without_new_job(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     client = build_client(session_factory)
 
-    payload = build_payload(
-        conclusion="failure",
-    )
+    payload = build_payload()
 
     headers = webhook_headers(
         payload,
@@ -206,15 +224,30 @@ def test_duplicate_delivery_returns_existing_run(
 
     assert first_body["run_id"] == second_body["run_id"]
 
+    async def count_database_records() -> tuple[int, int]:
+        async with session_factory() as session:
+            run_count = await session.scalar(
+                select(func.count()).select_from(RepairRunRecord),
+            )
 
-def test_different_deliveries_create_different_runs(
+            job_count = await session.scalar(
+                select(func.count()).select_from(RepairJobRecord),
+            )
+
+            return int(run_count or 0), int(job_count or 0)
+
+    run_count, job_count = asyncio.run(count_database_records())
+
+    assert run_count == 1
+    assert job_count == 1
+
+
+def test_different_deliveries_create_different_runs_and_jobs(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     client = build_client(session_factory)
 
-    payload = build_payload(
-        conclusion="failure",
-    )
+    payload = build_payload()
 
     first_response = client.post(
         "/webhooks/github",
@@ -241,6 +274,23 @@ def test_different_deliveries_create_different_runs(
     second_run_id = second_response.json()["run_id"]
 
     assert first_run_id != second_run_id
+
+    async def count_database_records() -> tuple[int, int]:
+        async with session_factory() as session:
+            run_count = await session.scalar(
+                select(func.count()).select_from(RepairRunRecord),
+            )
+
+            job_count = await session.scalar(
+                select(func.count()).select_from(RepairJobRecord),
+            )
+
+            return int(run_count or 0), int(job_count or 0)
+
+    run_count, job_count = asyncio.run(count_database_records())
+
+    assert run_count == 2
+    assert job_count == 2
 
 
 def test_successful_workflow_is_ignored(
