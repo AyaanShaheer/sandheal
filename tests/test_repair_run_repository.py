@@ -162,7 +162,6 @@ async def test_concurrent_duplicate_delivery_is_idempotent(
     This test uses two sessions against the same database.
     """
 
-
     engine = session.bind
 
     if engine is None:
