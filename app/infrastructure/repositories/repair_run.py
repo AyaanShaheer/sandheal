@@ -59,33 +59,15 @@ class RepairRunRepository:
 
         return self._to_domain(record)
 
-    async def create_from_github_failure(
+    async def add_from_github_failure(
         self,
         failure_event,
-    ) -> tuple[RepairRun, bool]:
+    ) -> RepairRun:
         """
-        Create a RepairRun from a normalized GitHub failure event.
+        Add a RepairRun to the current transaction.
 
-        Returns:
-            (run, created)
-
-            created=True:
-                A new RepairRun was created.
-
-            created=False:
-                The GitHub delivery was already processed.
-
-        The database UNIQUE constraint on delivery_id is the final
-        authority for idempotency. IntegrityError is handled so that
-        concurrent duplicate deliveries resolve to the same run.
+        This method does NOT commit.
         """
-
-        existing = await self.get_by_delivery_id(
-            failure_event.delivery_id,
-        )
-
-        if existing is not None:
-            return existing, False
 
         run = RepairRun(
             repository=failure_event.repository,
@@ -107,6 +89,30 @@ class RepairRunRepository:
         )
 
         self._session.add(record)
+
+        return run
+
+    async def create_from_github_failure(
+        self,
+        failure_event,
+    ) -> tuple[RepairRun, bool]:
+        """
+        Create a RepairRun independently.
+
+        This method retains the original repository behavior for callers
+        that only need to create a RepairRun.
+        """
+
+        existing = await self.get_by_delivery_id(
+            failure_event.delivery_id,
+        )
+
+        if existing is not None:
+            return existing, False
+
+        run = await self.add_from_github_failure(
+            failure_event,
+        )
 
         try:
             await self._session.commit()

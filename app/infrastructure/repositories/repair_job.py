@@ -36,7 +36,7 @@ class RepairJobRepository:
         run_id: UUID,
     ) -> RepairJobRecord | None:
         """
-        Retrieve the asynchronous job associated with a repair run.
+        Retrieve the repair job associated with a repair run.
         """
 
         result = await self._session.execute(
@@ -47,12 +47,14 @@ class RepairJobRepository:
 
         return result.scalar_one_or_none()
 
-    async def create(
+    async def add_pending(
         self,
         run_id: UUID,
     ) -> RepairJobRecord:
         """
-        Create a pending asynchronous repair job.
+        Add a pending RepairJob to the current transaction.
+
+        This method does NOT commit.
         """
 
         job = RepairJobRecord(
@@ -62,6 +64,21 @@ class RepairJobRepository:
         )
 
         self._session.add(job)
+
+        return job
+
+    async def create(
+        self,
+        run_id: UUID,
+    ) -> RepairJobRecord:
+        """
+        Create a pending asynchronous repair job independently.
+
+        This method retains the original behavior for callers that
+        explicitly want a standalone RepairJob creation.
+        """
+
+        job = await self.add_pending(run_id)
 
         await self._session.commit()
 
