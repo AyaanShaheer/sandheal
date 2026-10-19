@@ -10,3 +10,12 @@ class RepairJobStatus(StrEnum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_JOB_STATUSES: frozenset[RepairJobStatus] = frozenset(
+    {
+        RepairJobStatus.COMPLETED,
+        RepairJobStatus.CANCELLED,
+    }
+)

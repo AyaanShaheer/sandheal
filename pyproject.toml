@@ -13,18 +13,28 @@ license = { file = "LICENSE" }
 
 dependencies = [
     "fastapi>=0.116,<1.0",
-    "uvicorn[standard]>=0.35,<1.0",
+    "uvicorn>=0.35,<1.0",
     "pydantic-settings>=2.10,<3.0",
-    "sqlalchemy>=2.0,<3.0",
+    # The asyncio extra pulls in greenlet, which SQLAlchemy's async support
+    # requires at runtime. Without it the application cannot even be imported.
+    "sqlalchemy[asyncio]>=2.0,<3.0",
+    "aiosqlite>=0.22,<1.0",
+    # The application runs its schema migrations on startup, so Alembic is a
+    # runtime dependency rather than a development tool.
+    "alembic>=1.13,<2.0",
 ]
 
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.4,<9.0",
+    "pytest-cov>=5.0,<7.0",
     "httpx>=0.28,<1.0",
     "ruff>=0.12,<1.0",
-    "aiosqlite>=0.22,<1.0",
+    "anyio>=4.0,<5.0",
+    # The standard extra brings the reload watcher and the faster
+    # implementations, which are only needed during development.
+    "uvicorn[standard]>=0.35,<1.0",
 ]
 
 
@@ -32,6 +42,20 @@ dev = [
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
+
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
 
 
 [tool.ruff]
@@ -55,3 +79,7 @@ ignore = [
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+
+[tool.setuptools.package-data]
+"app.migrations" = ["script.py.mako"]

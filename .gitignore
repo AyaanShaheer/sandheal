@@ -16,7 +16,14 @@ env/
 # Testing
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
+
+# Local databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Ruff
 .ruff_cache/

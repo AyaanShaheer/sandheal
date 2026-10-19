@@ -4,6 +4,7 @@ from uuid import UUID
 import pytest
 
 from app.domain.enums import RunStatus
+from app.domain.errors import InvalidTransitionError
 from app.domain.models import RepairRun
 
 
@@ -115,3 +116,46 @@ def test_run_serializes_to_json() -> None:
     assert payload["repository"] == "AyaanShaheer/example"
     assert payload["commit_sha"] == "abc123"
     assert isinstance(payload["id"], str)
+
+
+def test_new_run_has_no_workflow_metadata() -> None:
+    run = RepairRun()
+
+    assert run.delivery_id is None
+    assert run.workflow_name is None
+    assert run.workflow_run_id is None
+    assert run.branch is None
+    assert run.conclusion is None
+
+
+def test_run_keeps_workflow_metadata() -> None:
+    run = RepairRun(
+        repository="AyaanShaheer/example",
+        commit_sha="abc123",
+        delivery_id="delivery-123",
+        workflow_name="CI",
+        workflow_run_id=12345,
+        branch="main",
+        conclusion="failure",
+    )
+
+    assert run.delivery_id == "delivery-123"
+    assert run.workflow_name == "CI"
+    assert run.workflow_run_id == 12345
+    assert run.branch == "main"
+    assert run.conclusion == "failure"
+
+
+def test_invalid_transition_raises_invalid_transition_error() -> None:
+    run = RepairRun()
+
+    with pytest.raises(InvalidTransitionError):
+        run.transition_to(RunStatus.VERIFYING)
+
+
+def test_invalid_transition_error_is_still_a_value_error() -> None:
+    """
+    Existing callers that catch ValueError must keep working.
+    """
+
+    assert issubclass(InvalidTransitionError, ValueError)

@@ -1,21 +1,11 @@
-from pydantic import BaseModel, Field
+from app.domain.failures import WorkflowFailure
 
+# The failure model used to live here and was named after the provider.
+# It now belongs to the domain, and this alias keeps existing imports
+# working.
+GitHubWorkflowFailure = WorkflowFailure
 
-class GitHubWorkflowFailure(BaseModel):
-    """
-    Internal representation of a failed GitHub Actions workflow.
-
-    This model intentionally hides GitHub's raw webhook structure from
-    the rest of the SandHeal application.
-    """
-
-    delivery_id: str = Field(min_length=1)
-
-    repository: str = Field(min_length=1)
-    commit_sha: str = Field(min_length=1)
-
-    workflow_name: str = Field(min_length=1)
-    workflow_run_id: int = Field(gt=0)
-
-    branch: str = Field(min_length=1)
-    conclusion: str = Field(min_length=1)
+__all__ = [
+    "GitHubWorkflowFailure",
+    "WorkflowFailure",
+]

@@ -11,7 +11,14 @@ def verify_signature(
     Verify a GitHub webhook using HMAC-SHA256.
 
     The payload must be the exact raw request body received from GitHub.
+
+    Verification fails closed: an unset secret can never produce a valid
+    signature, because an HMAC keyed with an empty string is trivially
+    computable by anyone.
     """
+
+    if not secret or not secret.strip():
+        return False
 
     if not signature_header:
         return False

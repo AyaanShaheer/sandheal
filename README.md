@@ -23,8 +23,10 @@ SandHeal is currently being built incrementally with a production-oriented archi
 * Health endpoint
 * Typed `RepairRun` domain model
 * Explicit repair lifecycle state machine
+* Persisted lifecycle transitions
 * GitHub Actions `workflow_run` webhook ingestion
 * HMAC-SHA256 webhook signature verification
+* Fail-closed webhook secret validation
 * GitHub failure-event normalization
 * SQLAlchemy async database layer
 * SQLite local development database
@@ -34,7 +36,17 @@ SandHeal is currently being built incrementally with a production-oriented archi
 * Idempotent GitHub delivery handling
 * Database-enforced uniqueness constraints
 * Transactional creation of `RepairRun` + `RepairJob`
+* Application-level logging
+* Request correlation IDs
+* Global error handling
+* Readiness endpoint
+* Database-enforced status constraints
+* Persisted job lifecycle
+* Alembic schema migrations
+* CI pipeline
+* Container image
 * Automated test suite
+* Coverage reporting
 * Ruff linting and formatting
 
 ### Planned
@@ -245,6 +257,7 @@ The currently implemented backend follows clear separation of responsibilities.
 ```text
 app/
 ├── api/
+│   ├── errors.py
 │   ├── github.py
 │   └── health.py
 │
@@ -252,17 +265,23 @@ app/
 │   └── repair_runs.py
 │
 ├── core/
-│   └── config.py
+│   ├── config.py
+│   ├── logger.py
+│   └── middleware.py
 │
 ├── domain/
 │   ├── enums.py
+│   ├── errors.py
+│   ├── failures.py
 │   ├── job_enums.py
 │   └── models.py
 │
 ├── infrastructure/
 │   ├── database.py
+│   ├── migrations.py
 │   │
 │   ├── models/
+│   │   ├── __init__.py
 │   │   ├── repair_run.py
 │   │   └── repair_job.py
 │   │
@@ -270,11 +289,16 @@ app/
 │       ├── repair_run.py
 │       └── repair_job.py
 │
-└── integrations/
-    └── github/
-        ├── models.py
-        ├── security.py
-        └── webhook.py
+├── integrations/
+│   └── github/
+│       ├── models.py
+│       ├── security.py
+│       └── webhook.py
+│
+└── migrations/               Alembic environment and revisions
+    ├── env.py
+    ├── script.py.mako
+    └── versions/
 ```
 
 ---
@@ -291,9 +315,54 @@ headers
 authentication/signatures
 HTTP responses
 dependency injection
+error handling
 ```
 
 It should not contain business logic or direct SQL operations.
+
+### Error handling
+
+Every response carries a correlation ID, taken from the incoming
+`X-Request-ID` header when present and generated otherwise:
+
+```text
+X-Request-ID: 3f9c1c2e-...
+```
+
+The ID is returned in the response header and included in the body of
+every error response, so a delivery reported by GitHub can be traced
+through the server logs.
+
+```text
+GET /does-not-exist  →  404
+{
+  "detail": "Not Found",
+  "request_id": "3f9c1c2e-..."
+}
+```
+
+An unexpected server error is logged with its traceback and returned as a
+generic body. Internals are never leaked to the caller:
+
+```text
+GET /boom  →  500
+{
+  "detail": "Internal Server Error",
+  "request_id": "3f9c1c2e-..."
+}
+```
+
+### Liveness and readiness
+
+```text
+GET /health  →  {"status": "ok"}          liveness only
+GET /ready   →  {"status": "ready"}        verifies the database
+```
+
+`/health` intentionally does not touch any dependency, so a database
+outage never restarts the process. `/ready` reports the database as
+unavailable with HTTP 503, so a load balancer can take the instance out
+of rotation.
 
 ---
 
@@ -328,7 +397,9 @@ Current examples:
 ```text
 RepairRun
 RunStatus
+RepairJob
 RepairJobStatus
+WorkflowFailure
 state transition rules
 ```
 
@@ -358,6 +429,20 @@ COMPLETED
 
 Terminal failure/cancellation paths are also represented.
 
+The `RepairJob` lifecycle follows the same pattern:
+
+```text
+PENDING
+    ↓
+PROCESSING
+    ↓
+COMPLETED
+```
+
+A failed job is not terminal: it can return to `PENDING` so the worker
+retries it. That is the difference between a run, which ends, and a job,
+which can be requeued.
+
 ---
 
 ## Infrastructure Layer
@@ -373,12 +458,62 @@ AsyncSession
 Repository pattern
 ```
 
+### Database constraints
+
+Invariants that matter are enforced by the database, not only by the
+application. Both status columns are constrained:
+
+```text
+CHECK (status IN ('received', 'reproducing', ...))
+CHECK (status IN ('pending', 'processing', ...))
+```
+
+A worker that writes a typo such as `generating_repair` is rejected by
+the database instead of storing a value that would later crash every
+read.
+
+### Single write path
+
+`RepairRunService` is the only supported way to create a repair run.
+The standalone repository methods that create a run or a job on their own
+are deprecated, because they break the invariant that a run always has
+its initial job:
+
+```text
+RepairRun exists  ⇔  its initial RepairJob exists
+```
+
 Production target:
 
 ```text
 PostgreSQL
-Alembic
 ```
+
+### Schema migrations
+
+The schema is managed by Alembic. The migration scripts live in
+`app/migrations/versions/` and are applied automatically when the
+application starts:
+
+```text
+alembic upgrade head
+```
+
+To create a migration after changing a model:
+
+```bash
+alembic revision --autogenerate -m "add repair hypothesis table"
+```
+
+The `Runtime` CI job and the test suite both verify that the migrations
+and the ORM models agree, so the two can never silently drift apart.
+
+A database that was created before Alembic existed already carries the
+schema but has no version. SandHeal detects that and stamps it with the
+baseline revision instead of trying to create tables that already exist.
+
+Set `AUTO_MIGRATE=false` to skip migrations and create the tables from
+the ORM metadata instead.
 
 ---
 
@@ -404,6 +539,20 @@ Redis
 
 This prevents external API structures from leaking throughout the application.
 
+The integration layer does not depend on the web framework. It raises
+`InvalidWebhookPayloadError`, a domain error, and the API layer decides
+which status code to return:
+
+```text
+app/integrations/github/webhook.py  →  InvalidWebhookPayloadError
+app/api/github.py                   →  400
+```
+
+The failure model itself lives in the domain as `WorkflowFailure`, so
+neither the domain nor the persistence layer depends on a provider.
+`app.integrations.github.models.GitHubWorkflowFailure` remains as an
+alias for backwards compatibility.
+
 ---
 
 # GitHub Webhook Flow
@@ -425,6 +574,8 @@ GitHub
    ↓
 POST /webhooks/github
    ↓
+Check the request body size and content type
+   ↓
 Read raw request body
    ↓
 Verify HMAC-SHA256 signature
@@ -444,6 +595,19 @@ Return HTTP response
 
 Unrelated successful workflows are ignored.
 
+### Input limits
+
+The endpoint refuses traffic it cannot use:
+
+```text
+Body larger than 1 MiB      →  413
+Content-Type not JSON       →  415
+Delivery ID longer than 64  →  400
+```
+
+The delivery ID is length checked because it is stored in a `VARCHAR(255)`
+column, and PostgreSQL enforces that length while SQLite does not.
+
 ---
 
 # Webhook Security
@@ -457,6 +621,26 @@ X-Hub-Signature-256
 SandHeal calculates the expected HMAC-SHA256 signature against the **raw request bytes** and compares it using a constant-time comparison.
 
 This prevents the application from accepting forged webhook requests.
+
+### Fail-closed secret handling
+
+An HMAC keyed with an empty string is computable by anyone, so an unset secret must never be able to produce a valid signature.
+
+SandHeal therefore treats the webhook secret as **not configured** when it is empty or a known placeholder such as the `replace-me` value shipped in `.env.example`.
+
+When the secret is not configured:
+
+```text
+POST /webhooks/github  →  503 {"detail": "GitHub webhook secret is not configured."}
+```
+
+The application also refuses to start in the `production` environment:
+
+```text
+RuntimeError: GITHUB_WEBHOOK_SECRET is not configured ...
+```
+
+In `development` the application still starts, so the rest of the stack remains usable, but the misconfiguration is reported as an error and every delivery is rejected.
 
 The normalized internal model intentionally hides GitHub's raw webhook structure from the rest of the application.
 
@@ -798,6 +982,29 @@ The current domain state machine is:
 
 Any stage can also enter controlled failure/cancellation states.
 
+### Persisting a transition
+
+The state machine is not documentation only: it is the authority on every
+status change. A transition is applied through the application service,
+which delegates the legality check to the domain model and persists the
+result in a single transaction.
+
+```python
+run = await RepairRunService(session).advance_run(
+    run_id,
+    RunStatus.REPRODUCING,
+)
+```
+
+An illegal transition raises `InvalidTransitionError` and leaves the stored
+run untouched. `InvalidTransitionError` subclasses `ValueError`, so
+existing handling of `ValueError` keeps working.
+
+The `RepairRun` domain object carries the same workflow metadata that the
+persistence record holds (`delivery_id`, `workflow_name`, `workflow_run_id`,
+`branch`, `conclusion`), so later phases can work from a stored run rather
+than from a webhook payload.
+
 ---
 
 # Reliability Principles
@@ -872,10 +1079,14 @@ The project currently contains tests covering:
 
 ```text
 RepairRun domain behavior
+RepairJob domain behavior
 state transitions
 terminal states
+persisted lifecycle transitions
 GitHub webhook validation
+webhook payload normalization
 webhook signatures
+fail-closed secret handling
 malformed payloads
 Unicode payload handling
 GitHub event filtering
@@ -883,7 +1094,13 @@ RepairRun persistence
 RepairJob persistence
 idempotent delivery handling
 database uniqueness
+database status constraints
 transactional Run + Job creation
+concurrent duplicate delivery
+startup schema registration
+request correlation
+global error handling
+readiness reporting
 ```
 
 The suite is executed with:
@@ -892,12 +1109,33 @@ The suite is executed with:
 pytest -v
 ```
 
+With a coverage report:
+
+```bash
+pytest --cov=app --cov-report=term-missing
+```
+
 Code quality checks:
 
 ```bash
 ruff check .
 ruff format --check .
 ```
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+```text
+Lint          ruff check + ruff format --check
+Test          pytest with coverage
+Runtime       pip install -e . (no dev extra), then import and boot the app
+```
+
+The `Runtime` job exists because a missing runtime dependency only shows
+up at deploy time. It installs the project exactly the way a production
+install would and boots the application, so that failure mode fails the
+build instead.
 
 ---
 
@@ -940,6 +1178,14 @@ Or using pip:
 pip install -e ".[dev]"
 ```
 
+The `[dev]` extra only adds the test and lint tooling. The runtime
+dependencies, including the `aiosqlite` driver used by the default
+database URL, are installed either way, so a production-style install is:
+
+```bash
+pip install -e .
+```
+
 ## Run tests
 
 ```bash
@@ -958,6 +1204,32 @@ ruff check .
 ruff format --check .
 ```
 
+## Common tasks
+
+A `Makefile` wraps the usual commands:
+
+```bash
+make help          # list the available targets
+make install-dev   # install with the development extras
+make test          # run the test suite
+make coverage      # run the test suite with coverage
+make lint          # run the linter
+make check         # lint and format check
+make migrate       # apply the database migrations
+make revision m="message"   # create a new migration
+make run           # start the development server
+```
+
+## Run with Docker
+
+```bash
+docker build -t sandheal .
+docker run --rm -p 8000:8000 -e GITHUB_WEBHOOK_SECRET=your-secret sandheal
+```
+
+The image installs the runtime dependencies only, runs as a non-root
+user and applies the database migrations on startup.
+
 ## Start development server
 
 ```bash
@@ -974,6 +1246,18 @@ Health endpoint:
 
 ```text
 http://127.0.0.1:8000/health
+```
+
+Readiness endpoint:
+
+```text
+http://127.0.0.1:8000/ready
+```
+
+Webhook endpoint:
+
+```text
+http://127.0.0.1:8000/webhooks/github
 ```
 
 Swagger documentation:
@@ -1000,9 +1284,26 @@ ENVIRONMENT=development
 DEBUG=false
 GITHUB_WEBHOOK_SECRET=replace-me
 DATABASE_URL=sqlite+aiosqlite:///./sandheal.db
+AUTO_MIGRATE=true
 ```
 
 Never commit real secrets.
+
+`GITHUB_WEBHOOK_SECRET` must be replaced with a real secret. The
+placeholder value shown above is publicly known, so SandHeal treats it as
+"not configured" and rejects every delivery with HTTP 503. See
+[Fail-closed secret handling](#fail-closed-secret-handling).
+
+`ENVIRONMENT` controls how a missing secret is handled: `development`
+starts anyway and logs an error, while `production` refuses to start.
+
+`AUTO_MIGRATE` controls the schema management. It is enabled by default,
+so the database is brought up to date with the Alembic migrations on
+startup. Set it to `false` to create the tables from the ORM metadata
+instead.
+
+The webhook secret is stored as a masked value, so it never appears in a
+log line, a `repr()` or a serialised settings dump.
 
 ---
 

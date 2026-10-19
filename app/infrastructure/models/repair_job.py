@@ -1,11 +1,13 @@
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Uuid
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.domain.job_enums import RepairJobStatus
 from app.infrastructure.database import Base
+
+JOB_STATUS_VALUES = ", ".join(f"'{status.value}'" for status in RepairJobStatus)
 
 
 class RepairJobRecord(Base):
@@ -15,6 +17,13 @@ class RepairJobRecord(Base):
     """
 
     __tablename__ = "repair_jobs"
+
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN ({JOB_STATUS_VALUES})",
+            name="ck_repair_jobs_status",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(
         Uuid,
@@ -52,4 +61,5 @@ class RepairJobRecord(Base):
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
     )

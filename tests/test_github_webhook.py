@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import StaticPool
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.infrastructure.database import Base, get_session
 from app.infrastructure.models.repair_job import RepairJobRecord
 from app.infrastructure.models.repair_run import RepairRunRecord
@@ -23,13 +23,13 @@ from app.main import create_app
 WEBHOOK_SECRET = "test-secret"
 
 
-def sign_payload(payload: bytes) -> str:
+def sign_payload(payload: bytes, *, secret: str = WEBHOOK_SECRET) -> str:
     """
     Generate a GitHub-compatible HMAC SHA-256 signature.
     """
 
     digest = hmac.new(
-        WEBHOOK_SECRET.encode("utf-8"),
+        secret.encode("utf-8"),
         payload,
         hashlib.sha256,
     ).hexdigest()
@@ -115,15 +115,17 @@ def session_factory() -> async_sessionmaker[AsyncSession]:
 
 def build_client(
     factory: async_sessionmaker[AsyncSession],
+    *,
+    webhook_secret: str = WEBHOOK_SECRET,
 ) -> TestClient:
     """
     Build a FastAPI test client using the isolated test database.
+
+    Settings are injected through a dependency override so that a test never
+    mutates the process-wide cached Settings instance.
     """
 
     app = create_app()
-
-    settings = get_settings()
-    settings.github_webhook_secret = WEBHOOK_SECRET
 
     async def override_get_session() -> AsyncGenerator[
         AsyncSession,
@@ -133,6 +135,10 @@ def build_client(
             yield session
 
     app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        environment="test",
+        github_webhook_secret=webhook_secret,
+    )
 
     return TestClient(app)
 
@@ -467,3 +473,186 @@ def test_signature_verification_works_with_unicode_payload(
 
     assert response.status_code == 202
     assert response.json()["accepted"] is True
+
+
+def test_missing_delivery_header_is_rejected(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = build_client(session_factory)
+
+    payload = build_payload()
+
+    headers = webhook_headers(payload)
+    headers.pop("X-GitHub-Delivery")
+
+    response = client.post(
+        "/webhooks/github",
+        content=payload,
+        headers=headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Missing X-GitHub-Delivery header."
+
+
+def test_oversized_body_is_rejected(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = build_client(session_factory)
+
+    payload = build_payload() + b" " * 1_048_576
+
+    response = client.post(
+        "/webhooks/github",
+        content=payload,
+        headers=webhook_headers(payload),
+    )
+
+    assert response.status_code == 413
+
+
+def test_unsupported_content_type_is_rejected(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = build_client(session_factory)
+
+    payload = build_payload()
+
+    headers = webhook_headers(payload)
+    headers["Content-Type"] = "text/plain"
+
+    response = client.post(
+        "/webhooks/github",
+        content=payload,
+        headers=headers,
+    )
+
+    assert response.status_code == 415
+
+
+def test_content_type_with_a_charset_is_accepted(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = build_client(session_factory)
+
+    payload = build_payload()
+
+    headers = webhook_headers(payload)
+    headers["Content-Type"] = "application/json; charset=utf-8"
+
+    response = client.post(
+        "/webhooks/github",
+        content=payload,
+        headers=headers,
+    )
+
+    assert response.status_code == 202
+
+
+def test_an_overlong_delivery_id_is_rejected(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client = build_client(session_factory)
+
+    payload = build_payload()
+
+    response = client.post(
+        "/webhooks/github",
+        content=payload,
+        headers=webhook_headers(payload, delivery_id="d" * 100),
+    )
+
+    assert response.status_code == 400
+
+
+def test_the_webhook_secret_is_masked_in_settings() -> None:
+    """
+    The secret must not leak through a log line or a repr.
+    """
+
+    settings = Settings(github_webhook_secret="super-secret-value")
+
+    assert "super-secret-value" not in repr(settings)
+    assert "super-secret-value" not in settings.model_dump_json()
+    assert settings.github_webhook_secret.get_secret_value() == "super-secret-value"
+
+
+def test_webhook_is_rejected_when_the_secret_is_not_configured(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """
+    An unset secret must fail closed rather than accept forged deliveries.
+    """
+
+    client = build_client(session_factory, webhook_secret="")
+
+    payload = build_payload()
+
+    response = client.post(
+        "/webhooks/github",
+        content=payload,
+        headers=webhook_headers(payload),
+    )
+
+    assert response.status_code == 503
+    assert "not configured" in response.json()["detail"]
+
+    async def count_database_records() -> tuple[int, int]:
+        async with session_factory() as session:
+            run_count = await session.scalar(
+                select(func.count()).select_from(RepairRunRecord),
+            )
+
+            job_count = await session.scalar(
+                select(func.count()).select_from(RepairJobRecord),
+            )
+
+            return int(run_count or 0), int(job_count or 0)
+
+    run_count, job_count = asyncio.run(count_database_records())
+
+    assert run_count == 0
+    assert job_count == 0
+
+
+def test_webhook_is_rejected_when_the_secret_is_a_placeholder(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """
+    The `replace-me` value shipped in .env.example is publicly known.
+    """
+
+    client = build_client(session_factory, webhook_secret="replace-me")
+
+    payload = build_payload()
+
+    response = client.post(
+        "/webhooks/github",
+        content=payload,
+        headers=webhook_headers(payload),
+    )
+
+    assert response.status_code == 503
+
+
+def test_forged_signature_is_rejected_even_with_a_known_secret(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """
+    A signature computed with a different secret must never be accepted.
+    """
+
+    client = build_client(session_factory)
+
+    payload = build_payload()
+
+    headers = webhook_headers(payload)
+    headers["X-Hub-Signature-256"] = sign_payload(payload, secret="attacker-secret")
+
+    response = client.post(
+        "/webhooks/github",
+        content=payload,
+        headers=headers,
+    )
+
+    assert response.status_code == 403

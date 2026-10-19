@@ -1,14 +1,19 @@
+from uuid import UUID
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.models import RepairRun
+from app.domain.enums import RunStatus
+from app.domain.errors import RunNotFoundError
+from app.domain.failures import WorkflowFailure
+from app.domain.job_enums import RepairJobStatus
+from app.domain.models import RepairJob, RepairRun
 from app.infrastructure.repositories.repair_job import (
     RepairJobRepository,
 )
 from app.infrastructure.repositories.repair_run import (
     RepairRunRepository,
 )
-from app.integrations.github.models import GitHubWorkflowFailure
 
 
 class RepairRunService:
@@ -24,7 +29,7 @@ class RepairRunService:
 
     async def create_from_github_failure(
         self,
-        failure_event: GitHubWorkflowFailure,
+        failure_event: WorkflowFailure,
     ) -> tuple[RepairRun, bool]:
         """
         Atomically create a RepairRun and its first pending RepairJob.
@@ -74,3 +79,75 @@ class RepairRunService:
         except Exception:
             await self._session.rollback()
             raise
+
+    async def advance_run(
+        self,
+        run_id: UUID,
+        new_status: RunStatus,
+    ) -> RepairRun:
+        """
+        Move a persisted repair run to the next lifecycle state.
+
+        The transition is validated by the domain state machine, so an
+        illegal transition raises InvalidTransitionError and leaves the
+        stored run untouched.
+
+        Returns:
+            The updated RepairRun.
+
+        Raises:
+            RunNotFoundError: when no run exists with the given ID.
+            InvalidTransitionError: when the transition is not permitted.
+        """
+
+        run = await self._repair_runs.apply_status_transition(
+            run_id,
+            new_status,
+        )
+
+        if run is None:
+            raise RunNotFoundError(f"Repair run '{run_id}' does not exist.")
+
+        try:
+            await self._session.commit()
+        except Exception:
+            await self._session.rollback()
+            raise
+
+        return run
+
+    async def advance_job(
+        self,
+        job_id: UUID,
+        new_status: RepairJobStatus,
+    ) -> RepairJob:
+        """
+        Move a persisted repair job to the next lifecycle state.
+
+        The transition is validated by the domain state machine, so an
+        illegal transition raises InvalidTransitionError and leaves the
+        stored job untouched.
+
+        Returns:
+            The updated RepairJob.
+
+        Raises:
+            RunNotFoundError: when no job exists with the given ID.
+            InvalidTransitionError: when the transition is not permitted.
+        """
+
+        job = await self._repair_jobs.apply_status_transition(
+            job_id,
+            new_status,
+        )
+
+        if job is None:
+            raise RunNotFoundError(f"Repair job '{job_id}' does not exist.")
+
+        try:
+            await self._session.commit()
+        except Exception:
+            await self._session.rollback()
+            raise
+
+        return job

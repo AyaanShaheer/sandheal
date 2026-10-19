@@ -1,44 +1,24 @@
+import asyncio
 from datetime import UTC
 from uuid import UUID
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
-from sqlalchemy.pool import StaticPool
 
 from app.infrastructure.database import Base
+from app.infrastructure.models.repair_run import RepairRunRecord
 from app.infrastructure.repositories.repair_run import (
     RepairRunRepository,
 )
 from app.integrations.github.models import GitHubWorkflowFailure
 
-
-@pytest.fixture
-async def session() -> AsyncSession:
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={
-            "check_same_thread": False,
-        },
-        poolclass=StaticPool,
-    )
-
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-
-    session_factory = async_sessionmaker(
-        engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
-
-    async with session_factory() as db_session:
-        yield db_session
-
-    await engine.dispose()
+# This module exercises the deprecated standalone creation path on purpose.
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 
 def build_failure_event(
@@ -150,25 +130,38 @@ async def test_different_deliveries_create_different_runs(
     assert first_run.id != second_run.id
 
 
-@pytest.mark.asyncio
 @pytest.mark.anyio
-async def test_concurrent_duplicate_delivery_is_idempotent(
+async def test_standalone_creation_is_deprecated(
     session: AsyncSession,
 ) -> None:
     """
-    Verify that the database uniqueness constraint protects against
-    duplicate creation when two repository operations race.
-
-    This test uses two sessions against the same database.
+    Creating a run on its own breaks the run/job invariant, so the method
+    is deprecated in favour of the application service.
     """
 
-    engine = session.bind
+    repository = RepairRunRepository(session)
 
-    if engine is None:
-        raise AssertionError("Test session has no bound engine.")
+    with pytest.warns(DeprecationWarning, match="RepairRunService"):
+        await repository.create_from_github_failure(build_failure_event())
+
+
+@pytest.mark.anyio
+async def test_concurrent_duplicate_delivery_is_idempotent(
+    concurrent_engine: AsyncEngine,
+) -> None:
+    """
+    Verify that the database uniqueness constraint protects against
+    duplicate creation when two repository operations genuinely race.
+
+    Both operations are started before either one commits, so the second
+    insert has to be rejected by the UNIQUE(delivery_id) constraint.
+    """
+
+    async with concurrent_engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
 
     session_factory = async_sessionmaker(
-        engine,
+        concurrent_engine,
         class_=AsyncSession,
         expire_on_commit=False,
     )
@@ -184,27 +177,23 @@ async def test_concurrent_duplicate_delivery_is_idempotent(
             delivery_id="concurrent-delivery",
         )
 
-        first_existing = await first_repository.get_by_delivery_id(
-            event.delivery_id,
-        )
-        second_existing = await second_repository.get_by_delivery_id(
-            event.delivery_id,
+        first_result, second_result = await asyncio.gather(
+            first_repository.create_from_github_failure(event),
+            second_repository.create_from_github_failure(event),
         )
 
-        assert first_existing is None
-        assert second_existing is None
+        first_run, first_created = first_result
+        second_run, second_created = second_result
 
-        first_run, first_created = await first_repository.create_from_github_failure(
-            event,
-        )
-
-        second_run, second_created = await second_repository.create_from_github_failure(
-            event,
-        )
-
-        assert first_created is True
-        assert second_created is False
+        assert first_created is not second_created
         assert first_run.id == second_run.id
+
+        async with session_factory() as session:
+            run_count = await session.scalar(
+                select(func.count()).select_from(RepairRunRecord),
+            )
+
+        assert run_count == 1
 
     finally:
         await first_session.close()

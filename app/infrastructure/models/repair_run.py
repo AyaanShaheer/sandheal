@@ -1,11 +1,13 @@
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, Integer, String, Uuid
+from sqlalchemy import CheckConstraint, DateTime, Integer, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.domain.enums import RunStatus
 from app.infrastructure.database import Base
+
+RUN_STATUS_VALUES = ", ".join(f"'{status.value}'" for status in RunStatus)
 
 
 class RepairRunRecord(Base):
@@ -14,6 +16,13 @@ class RepairRunRecord(Base):
     """
 
     __tablename__ = "repair_runs"
+
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN ({RUN_STATUS_VALUES})",
+            name="ck_repair_runs_status",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(
         Uuid,
@@ -74,4 +83,5 @@ class RepairRunRecord(Base):
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
     )

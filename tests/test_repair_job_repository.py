@@ -6,46 +6,16 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
 )
-from sqlalchemy.pool import StaticPool
 
 from app.domain.job_enums import RepairJobStatus
-from app.infrastructure.database import Base
 from app.infrastructure.models.repair_job import RepairJobRecord
 from app.infrastructure.repositories.repair_job import RepairJobRepository
 from app.infrastructure.repositories.repair_run import RepairRunRepository
 from app.integrations.github.models import GitHubWorkflowFailure
 
-
-@pytest.fixture
-async def session() -> AsyncSession:
-    """
-    Create an isolated in-memory database for each test.
-    """
-
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={
-            "check_same_thread": False,
-        },
-        poolclass=StaticPool,
-    )
-
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-
-    session_factory = async_sessionmaker(
-        engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
-
-    async with session_factory() as db_session:
-        yield db_session
-
-    await engine.dispose()
+# This module exercises the deprecated standalone creation path on purpose.
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 
 async def create_repair_run(
@@ -189,6 +159,23 @@ async def test_different_runs_can_have_different_jobs(
     assert first_job.id != second_job.id
     assert first_job.run_id == first_run.id
     assert second_job.run_id == second_run.id
+
+
+@pytest.mark.anyio
+async def test_standalone_creation_is_deprecated(
+    session: AsyncSession,
+) -> None:
+    """
+    Creating a job on its own breaks the run/job invariant, so the method
+    is deprecated in favour of the application service.
+    """
+
+    run = await create_repair_run(session)
+
+    repository = RepairJobRepository(session)
+
+    with pytest.warns(DeprecationWarning, match="RepairRunService"):
+        await repository.create(run.id)
 
 
 @pytest.mark.anyio
